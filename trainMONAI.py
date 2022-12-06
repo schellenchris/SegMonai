@@ -1,11 +1,14 @@
 import os
 import glob
+import warnings
+
 import numpy as np
 import pandas as pd
 import config as cfg
 from monai.networks.nets import UNet
 
-from monai.data import ArrayDataset, create_test_image_3d, decollate_batch, DataLoader, ImageDataset
+from monai.data import (ArrayDataset, create_test_image_3d, decollate_batch,
+                        DataLoader, ImageDataset, PatchIterd, Dataset, GridPatchDataset)
 from monai.utils import set_determinism
 from monai.data.utils import list_data_collate, decollate_batch, no_collation
 from monai.transforms import (
@@ -27,7 +30,15 @@ from monai.transforms import (
     RandShiftIntensity,
     NormalizeIntensity,
     RandSpatialCropSamples,
-    CropForeground
+    CropForeground,
+    EnsureTyped,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Spacingd,
+    Orientationd,
+    NormalizeIntensityd,
+    RandRotated,
+    EnsureTyped
 )
 import ignite
 import torch
@@ -35,7 +46,7 @@ from monai.losses import DiceLoss, DiceCELoss
 from monai.handlers import StatsHandler
 from monai.utils import first
 from ignite.handlers import ModelCheckpoint
-from ignite.engine import Events
+from ignite.engine import Events, _prepare_batch
 
 experiment_name = "liver_seg"
 logs_path = os.path.join("tmp", experiment_name)
@@ -81,7 +92,7 @@ def _make_folder_name(hyper_parameters, seed):
     return folder_name
 
 
-def _set_parameters_according_to_dimension(hyper_parameters):
+def _set_config():
     cfg.set_attrs(
         cfg,
         num_channels=1,
@@ -103,66 +114,67 @@ def _set_parameters_according_to_dimension(hyper_parameters):
         optim=torch.optim.Adam,  # SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
         loss=DiceLoss()  # DiceCELoss()
     )
-        
-    print('   Train Shapes: ', cfg.train_input_shape, cfg.train_label_shape)
-    print('   Test Shapes: ', cfg.test_data_shape, cfg.test_label_shape)
+    print('Train Shapes: ', cfg.train_input_shape, cfg.train_label_shape)
+    print('Test Shapes: ', cfg.test_data_shape, cfg.test_label_shape)
 
 
-def get_transpose():
-    im_trans = Compose(
+def get_transform(dict_transform=False):
+    if dict_transform:
+        return Compose(
+            [
+                LoadImaged(keys=["img", "seg"]),
+                EnsureChannelFirstd(keys=["img", "seg"]),
+                # Spacingd(keys=["img", "seg"], pixdim=cfg.target_spacing),
+                Orientationd(keys=["img", "seg"], axcodes='PLI'),
+                NormalizeIntensityd(keys='img'),
+                RandRotated(keys=["img"], range_z=(12.6, 12.6), prob=0.25),
+                EnsureTyped(keys=["img", "seg"]),
+            ]
+        )
+    img_trans = Compose(
         [
             EnsureChannelFirst(),
-            Spacing(pixdim=cfg.target_spacing),
+            # Spacing(pixdim=cfg.target_spacing),
             Orientation(axcodes='PLI'),
             NormalizeIntensity(),
-            ResizeWithPadOrCrop([512, 512, 64], mode='minimum'),
-            RandRotate(range_z=[12.6, 12.6], prob=0.25),
-            # CenterSpatialCrop((512, 512, 64)),
-            # CropForeground(),
-            # RandSpatialCrop((256, 256, 32), random_size=False),
-            # RandFlip(prob=0.5, spatial_axis=1),
-            # RandGaussianNoise(mean=0, std=0.01),
-            # RandShiftIntensity(prob=0.5, offsets=(10, 20))
+            RandRotate(range_z=(12.6, 12.6), prob=0.25),
+            ResizeWithPadOrCrop([512, 512, 64], mode='minimum')
         ]
     )
-
     seg_trans = Compose(
         [
             EnsureChannelFirst(),
-            Spacing(pixdim=cfg.target_spacing),
+            # Spacing(pixdim=cfg.target_spacing),
             Orientation(axcodes='PLI'),
-            ResizeWithPadOrCrop([512, 512, 64], mode='minimum'),
-            RandRotate(range_z=[12.6, 12.6], prob=0.25),
-            # CenterSpatialCrop((512, 512, 64)),
-            # CropForeground(),
-            # RandSpatialCrop((256, 256, 32), random_size=False),
-            # RandFlip(prob=1, spatial_axis=1)
-            # AsDiscrete(to_onehot=2)
+            ResizeWithPadOrCrop([512, 512, 64], mode='minimum')
         ]
     )
-    return im_trans, seg_trans
+    return img_trans, seg_trans
 
 
-def get_filenames(file=cfg.train_csv):
+def get_filenames(file=None):
+    file = cfg.train_csv if file is None else file
     files = pd.read_csv(file, dtype=object).values
     files = [(os.path.split(file_id[0])[0], os.path.split(file_id[0])[1]) for file_id in files]
-    imgs = [os.path.join(folder, cfg.sample_file_name_prefix + number + '.nii') for folder, number in files]
-    segs = [os.path.join(folder, cfg.label_file_name_prefix + number + '.nii') for folder, number in files]
-    return imgs, segs
+    img_files = [os.path.join(folder, cfg.sample_file_name_prefix + number + '.nii') for folder, number in files]
+    seg_files = [os.path.join(folder, cfg.label_file_name_prefix + number + '.nii') for folder, number in files]
+    return img_files, seg_files
 
 
-def get_loader(file=cfg.train_csv):
-    img_trans, seg_trans = get_transpose()
-    imgs, segs = get_filenames(file)
+def get_loader(img_files=None, seg_files=None, file=None):
+    if img_files is None:
+        file = cfg.train_csv if file is None else file
+        img_files, seg_files = get_filenames(file)
+    img_trans, seg_trans = get_transform()
     ds = ImageDataset(
-        image_files=imgs,
-        seg_files=segs,
+        image_files=img_files,
+        seg_files=seg_files,
         transform=img_trans,
         seg_transform=seg_trans,
         image_only=True,
     )
     return DataLoader(
-        ds, batch_size=1, num_workers=2, pin_memory=torch.cuda.is_available(), shuffle=True
+        ds, batch_size=1, num_workers=2, pin_memory=torch.cuda.is_available(), shuffle=False
     )
 
 
@@ -187,28 +199,77 @@ def save_checkpoints(net, optim, trainer, path, net_name='net'):
     torch.save(optim, f'{path}/{net_name}_optim.pt')
 
 
-def load_checkpoint(path, net_name='net', checkpoint=None):
+def load_checkpoint(path=None, net_name='net', checkpoint=None):
+    path = './checkpoints/' if path is None else path
     net = torch.load(f'{path}/{net_name}.pt')
     optim = torch.load(f'{path}/{net_name}_optim.pt')
     objects_to_checkpoint = {"net": net, "opt": optim}
     list_of_files = glob.glob(f'{path}/*.pt')
-    latest_file = max([file for file in list_of_files if 'checkpoint' in file], key=os.path.getctime)
-    ModelCheckpoint.load_objects(to_load=objects_to_checkpoint, checkpoint=torch.load(latest_file))
+    if checkpoint is None:
+        checkpoint = max([file for file in list_of_files if 'checkpoint' in file], key=os.path.getctime)
+        warnings.warn(f'No checkpoint specified loading {checkpoint}')
+    ModelCheckpoint.load_objects(to_load=objects_to_checkpoint, checkpoint=torch.load(checkpoint))
     return net, optim
 
 
-def train(seed=42):
+def train(network=None, data_loader=None, dict_transforms=False, epochs=None, optimizer=None, loss=None, checkpoint_folder=None, seed=42):
     np.random.seed(seed)
     set_determinism(seed=seed)
-    loader = get_loader()
-    net = get_network()
-    optim = cfg.optim(net.parameters(), cfg.lr)
+    net = get_network() if network is None else network
+    loader = get_loader() if data_loader is None else data_loader
+    optim = cfg.optim(net.parameters(), cfg.lr) if optimizer is None else optimizer
     trainer = ignite.engine.create_supervised_trainer(
-        net, optim, cfg.loss, cfg.device
+        net, optim, cfg.loss if loss is None else loss, cfg.device,
+        prepare_batch=lambda batch, device, non_blocking:
+        _prepare_batch((batch["img"], batch["seg"]), device, non_blocking) if dict_transforms else _prepare_batch
     )
-    save_checkpoints(net, optim, trainer, "./runs_array/DiceCELoss/")
+    if checkpoint_folder is None:
+        checkpoint_folder = './checkpoints/'
+        warnings.warn(f'No checkpoint folder specified, using {checkpoint_folder}')
+    save_checkpoints(net, optim, trainer, checkpoint_folder)
     StatsHandler(name='trainer', output_transform=lambda x: x).attach(trainer)
-    state = trainer.run(loader, cfg.training_epochs)
+    state = trainer.run(loader, cfg.training_epochs if epochs is None else epochs)
+    return state
+
+
+def set_device(device_id=0, name=None):
+    if not torch.cuda.is_available():
+        warnings.warn('No available CUDA device found, setting device to CPU')
+        cfg.device = torch.device('cpu')
+    if name is not None:
+        devices = {i: torch.cuda.get_device_properties(i).name.lower() for i in range(torch.cuda.device_count())}
+        count = 0
+        for key in devices.keys():
+            if name.lower() in devices[key]:
+                count += 1
+                device_id = key
+        if count > 1:
+            warnings.warn(f'Found multiple GPUs matching the name {name}')
+    print(f'Setting device to {torch.cuda.get_device_properties(device_id).name}')
+    cfg.device = torch.device(f'cuda:{device_id}')
+
+
+def get_slice_loader(img_files=None, seg_files=None, file=None):
+    if img_files is None:
+        file = cfg.train_csv if file is None else file
+        img_files, seg_files = get_filenames(file)
+    train_files = [{"img": img, "seg": seg} for img, seg in zip(img_files, seg_files)]
+    patch_func = PatchIterd(
+        keys=["img", "seg"],
+        patch_size=(None, None, 32),  # dynamic first two dimensions
+        start_pos=(0, 0, 0),
+        mode='minimum'
+    )
+    patch_transform = Compose(
+        [
+            EnsureTyped(keys=["img", "seg"]),
+        ]
+    )
+    train_transforms = get_transform(dict_transform=True)
+    volume_ds = Dataset(data=train_files, transform=train_transforms)
+    patch_ds = GridPatchDataset(
+        data=volume_ds, patch_iter=patch_func, transform=patch_transform, with_coordinates=False)
+    return DataLoader(patch_ds, batch_size=1, num_workers=2, pin_memory=torch.cuda.is_available(), shuffle=False)
 
 
 def experiment_3(data, hyper_parameters, k_fold, dimensions_and_architectures, losses, augment_val):
@@ -229,7 +290,7 @@ def experiment_3(data, hyper_parameters, k_fold, dimensions_and_architectures, l
             train_files = data_set[train_indices]
             val_files = data_set[val_indices]
             test_files = data_set[test_indices]
-            #train_files = np.vstack([train_files, test_files])
+            # train_files = np.vstack([train_files, test_files])
 
             np.savetxt(cfg.train_csv, train_files, fmt='%s', header='path')
             np.savetxt(cfg.val_csv, val_files, fmt='%s', header='path')
@@ -243,7 +304,8 @@ def experiment_3(data, hyper_parameters, k_fold, dimensions_and_architectures, l
 
             for d, a in dimensions_and_architectures:
                 hyper_parameters["dimensions"] = d
-                _set_parameters_according_to_dimension(hyper_parameters)
+                # _set_parameters_according_to_dimension(hyper_parameters)
+                _set_config()
                 hyper_parameters['architecture'] = a
                 for l in losses:
                     hyper_parameters["loss"] = l
@@ -261,22 +323,25 @@ def experiment_3(data, hyper_parameters, k_fold, dimensions_and_architectures, l
 
 
 if __name__ == '__main__':
-    np.random.seed(42)
+    # np.random.seed(42)
     chaos_csv = 'chaos.csv'
-    all_chaos_files = pd.read_csv(chaos_csv, dtype=object).values
-    k_fold = 2
-    losses = ['CEL+DICE']
-    dimensions_and_architectures = ([3, UNet])
+    # all_chaos_files = pd.read_csv(chaos_csv, dtype=object).values
+    # k_fold = 2 TODO
+    # losses = ['CEL+DICE']
+    # dimensions_and_architectures = ([3, UNet])
+    #
+    # init_parameters = {"regularize": [True, 'L2', 0.0000001], "drop_out": [True, 0.01], "activation": "elu",
+    #                    "do_batch_normalization": False, "do_bias": True, "cross_hair": False}
+    # train_parameters = {"l_r": 0.001, "optimizer": "Adam", "early_stopping": [True, cfg.min_n_epochs, 1e-4]}
+    # hyper_parameters = {"init_parameters": init_parameters, "train_parameters": train_parameters}
+    #
+    # windowing = [(-200, 200), (-200, 250), (-100, 400)]
+    # train_dim = [256, 512]
 
-    init_parameters = {"regularize": [True, 'L2', 0.0000001], "drop_out": [True, 0.01], "activation": "elu",
-                       "do_batch_normalization": False, "do_bias": True, "cross_hair": False}
-    train_parameters = {"l_r": 0.001, "optimizer": "Adam", "early_stopping": [True, cfg.min_n_epochs, 1e-4]}
-    hyper_parameters = {"init_parameters": init_parameters, "train_parameters": train_parameters}
-
-    windowing = [(-200, 200), (-200, 250), (-100, 400)]
-    train_dim = [256, 512]
-
-    # load_checkpoint("./runs_array/DiceCELoss/")
-    train()
-
+    net, optim = load_checkpoint()
+    loader = get_slice_loader()
+    check_data = first(loader)
+    print("first volume's shape: ", check_data["img"].shape, check_data["seg"].shape)
+    train(data_loader=get_slice_loader(), dict_transforms=True)
+    # set_device(name='gtx 1050')
 
