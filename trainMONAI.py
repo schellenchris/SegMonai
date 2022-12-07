@@ -8,7 +8,7 @@ import config as cfg
 from monai.networks.nets import UNet
 
 from monai.data import (ArrayDataset, create_test_image_3d, decollate_batch,
-                        DataLoader, ImageDataset, PatchIterd, Dataset, GridPatchDataset)
+                        DataLoader, ImageDataset, PatchIterd, Dataset, GridPatchDataset, CacheDataset)
 from monai.utils import set_determinism
 from monai.data.utils import list_data_collate, decollate_batch, no_collation
 from monai.transforms import (
@@ -43,10 +43,11 @@ from monai.transforms import (
 import ignite
 import torch
 from monai.losses import DiceLoss, DiceCELoss
-from monai.handlers import StatsHandler
+from monai.handlers import StatsHandler, MeanDice, TensorBoardStatsHandler
 from monai.utils import first
 from ignite.handlers import ModelCheckpoint
 from ignite.engine import Events, _prepare_batch
+import nibabel as nib
 
 experiment_name = "liver_seg"
 logs_path = os.path.join("tmp", experiment_name)
@@ -152,13 +153,40 @@ def get_transform(dict_transform=False):
     return img_trans, seg_trans
 
 
-def get_filenames(file=None):
+def get_filenames(file=None, k_fold=1, val_size=None):
     file = cfg.train_csv if file is None else file
     files = pd.read_csv(file, dtype=object).values
     files = [(os.path.split(file_id[0])[0], os.path.split(file_id[0])[1]) for file_id in files]
-    img_files = [os.path.join(folder, cfg.sample_file_name_prefix + number + '.nii') for folder, number in files]
-    seg_files = [os.path.join(folder, cfg.label_file_name_prefix + number + '.nii') for folder, number in files]
-    return img_files, seg_files
+    img_files = np.array([os.path.join(folder, cfg.sample_file_name_prefix + number + '.nii') for folder, number in files])
+    seg_files = np.array([os.path.join(folder, cfg.label_file_name_prefix + number + '.nii') for folder, number in files])
+    all_indices = np.random.permutation(range(len(img_files)))
+    test_folds = np.array_split(all_indices, k_fold)
+    k_folds = []
+    for k in range(k_fold):
+        test_indices = test_folds[k]
+        remaining_indices = np.setdiff1d(all_indices, test_indices)
+        val_indices = remaining_indices[:val_size] if val_size else remaining_indices[:cfg.number_of_val]
+        train_indices = remaining_indices[val_size:] if val_size else remaining_indices[cfg.number_of_val:]
+        test_img_files, test_seg_files = img_files[test_indices], seg_files[test_indices]
+        train_img_files, train_seg_files = img_files[train_indices], seg_files[train_indices]
+        val_img_files, val_seg_files = img_files[val_indices], seg_files[val_indices]
+        k_folds.append(
+            {
+                'train': {
+                    'img_files': train_img_files,
+                    'seg_files': train_seg_files
+                },
+                'val': {
+                    'img_files': val_img_files,
+                    'seg_files': val_seg_files
+                },
+                'test': {
+                    'img_files': test_img_files,
+                    'seg_files': test_seg_files
+                }
+            }
+        )
+    return k_folds
 
 
 def get_loader(img_files=None, seg_files=None, file=None):
@@ -212,7 +240,8 @@ def load_checkpoint(path=None, net_name='net', checkpoint=None):
     return net, optim
 
 
-def train(network=None, data_loader=None, dict_transforms=False, epochs=None, optimizer=None, loss=None, checkpoint_folder=None, seed=42):
+def train(network=None, data_loader=None, val_loader=None, validation_after=None, dict_transforms=False, epochs=None,
+          optimizer=None, loss=None, checkpoint_folder=None, seed=42):
     np.random.seed(seed)
     set_determinism(seed=seed)
     net = get_network() if network is None else network
@@ -223,13 +252,41 @@ def train(network=None, data_loader=None, dict_transforms=False, epochs=None, op
         prepare_batch=lambda batch, device, non_blocking:
         _prepare_batch((batch["img"], batch["seg"]), device, non_blocking) if dict_transforms else _prepare_batch
     )
+    if val_loader is not None:
+        val_metrics = {'Mean_Dice': MeanDice()}
+        post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
+        post_label = Compose([AsDiscrete(threshold=0.5)])
+        evaluator = ignite.engine.create_supervised_evaluator(
+            net,
+            val_metrics,
+            cfg.device,
+            True,
+            output_transform=lambda x, y, y_pred: ([post_pred(i) for i in decollate_batch(y_pred)],
+                                                   [post_label(i) for i in decollate_batch(y)]),
+            prepare_batch=lambda batch, device, non_blocking:
+            _prepare_batch((batch["img"], batch["seg"]), device, non_blocking) if dict_transforms else _prepare_batch
+        )
+
+        @trainer.on(Events.ITERATION_COMPLETED(every=validation_after))
+        def run_validation(engine):
+            evaluator.run(val_loader)
     if checkpoint_folder is None:
         checkpoint_folder = './checkpoints/'
         warnings.warn(f'No checkpoint folder specified, using {checkpoint_folder}')
     save_checkpoints(net, optim, trainer, checkpoint_folder)
     StatsHandler(name='trainer', output_transform=lambda x: x).attach(trainer)
+    TensorBoardStatsHandler(output_transform=lambda x: x).attach(trainer)
     state = trainer.run(loader, cfg.training_epochs if epochs is None else epochs)
     return state
+
+
+def train_k_fold(network=None, k_fold=1, dict_transforms=False, epochs=None, optimizer=None, loss=None, checkpoint_folder=None, seed=42):
+    files = get_filenames(k_fold=k_fold)
+    for fold in files:
+        train_loader = get_loader(fold['train']['img_files'], fold['train']['seg_files'])
+        val_loader = get_loader(fold['val']['img_files'], fold['val']['seg_files'])
+        test_loader = get_loader(fold['test']['img_files'], fold['test']['seg_files'])
+        train(data_loader=train_loader, val_loader=val_loader)
 
 
 def set_device(device_id=0, name=None):
@@ -249,7 +306,7 @@ def set_device(device_id=0, name=None):
     cfg.device = torch.device(f'cuda:{device_id}')
 
 
-def get_slice_loader(img_files=None, seg_files=None, file=None):
+def get_slice_loader(img_files=None, seg_files=None, file=None, cache=True):
     if img_files is None:
         file = cfg.train_csv if file is None else file
         img_files, seg_files = get_filenames(file)
@@ -267,8 +324,11 @@ def get_slice_loader(img_files=None, seg_files=None, file=None):
     )
     train_transforms = get_transform(dict_transform=True)
     volume_ds = Dataset(data=train_files, transform=train_transforms)
+    shapes = [nib.load(img).shape for img in img_files] if cache else None
     patch_ds = GridPatchDataset(
-        data=volume_ds, patch_iter=patch_func, transform=patch_transform, with_coordinates=False)
+        data=volume_ds, patch_iter=patch_func, transform=patch_transform, with_coordinates=False, shapes=shapes)
+    if cache:
+        patch_ds = CacheDataset(data=patch_ds, transform=None)
     return DataLoader(patch_ds, batch_size=1, num_workers=2, pin_memory=torch.cuda.is_available(), shuffle=False)
 
 
@@ -337,11 +397,11 @@ if __name__ == '__main__':
     #
     # windowing = [(-200, 200), (-200, 250), (-100, 400)]
     # train_dim = [256, 512]
-
-    net, optim = load_checkpoint()
-    loader = get_slice_loader()
-    check_data = first(loader)
-    print("first volume's shape: ", check_data["img"].shape, check_data["seg"].shape)
-    train(data_loader=get_slice_loader(), dict_transforms=True)
+    #
+    # net, optim = load_checkpoint()
+    # loader = get_slice_loader()
+    # check_data = first(loader)
+    # print("first volume's shape: ", check_data["img"].shape, check_data["seg"].shape)
+    # train(data_loader=get_slice_loader(), dict_transforms=True)
     # set_device(name='gtx 1050')
-
+    train_k_fold(k_fold=3)
