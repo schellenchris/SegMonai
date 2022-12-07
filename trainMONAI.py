@@ -7,8 +7,17 @@ import pandas as pd
 import config as cfg
 from monai.networks.nets import UNet
 
-from monai.data import (ArrayDataset, create_test_image_3d, decollate_batch,
-                        DataLoader, ImageDataset, PatchIterd, Dataset, GridPatchDataset, CacheDataset)
+from monai.data import (
+    ArrayDataset,
+    create_test_image_3d,
+    decollate_batch,
+    DataLoader,
+    ImageDataset,
+    PatchIterd,
+    Dataset,
+    GridPatchDataset,
+    CacheDataset
+)
 from monai.utils import set_determinism
 from monai.data.utils import list_data_collate, decollate_batch, no_collation
 from monai.transforms import (
@@ -43,9 +52,15 @@ from monai.transforms import (
 import ignite
 import torch
 from monai.losses import DiceLoss, DiceCELoss
-from monai.handlers import StatsHandler, MeanDice, TensorBoardStatsHandler
+from monai.handlers import (
+    StatsHandler,
+    MeanDice,
+    TensorBoardStatsHandler,
+    stopping_fn_from_metric,
+    TensorBoardImageHandler
+)
 from monai.utils import first
-from ignite.handlers import ModelCheckpoint
+from ignite.handlers import ModelCheckpoint, EarlyStopping
 from ignite.engine import Events, _prepare_batch
 import nibabel as nib
 
@@ -253,7 +268,8 @@ def train(network=None, data_loader=None, val_loader=None, validation_after=None
         _prepare_batch((batch["img"], batch["seg"]), device, non_blocking) if dict_transforms else _prepare_batch
     )
     if val_loader is not None:
-        val_metrics = {'Mean_Dice': MeanDice()}
+        metric_name = 'Mean_Dice'
+        val_metrics = {metric_name: MeanDice()}
         post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
         post_label = Compose([AsDiscrete(threshold=0.5)])
         evaluator = ignite.engine.create_supervised_evaluator(
@@ -270,6 +286,41 @@ def train(network=None, data_loader=None, val_loader=None, validation_after=None
         @trainer.on(Events.ITERATION_COMPLETED(every=validation_after))
         def run_validation(engine):
             evaluator.run(val_loader)
+
+        # add early stopping handler to evaluator
+        early_stopper = EarlyStopping(
+            patience=4, score_function=stopping_fn_from_metric(metric_name), trainer=trainer
+        )
+        evaluator.add_event_handler(
+            event_name=Events.EPOCH_COMPLETED, handler=early_stopper
+        )
+
+        # add stats event handler to print validation stats via evaluator
+        val_stats_handler = StatsHandler(
+            name="evaluator",
+            output_transform=lambda x: None,  # no need to print loss value, so disable per iteration output
+            global_epoch_transform=lambda x: trainer.state.epoch,
+        )  # fetch global epoch number from trainer
+        val_stats_handler.attach(evaluator)
+
+        # add handler to record metrics to TensorBoard at every validation epoch
+        val_tensorboard_stats_handler = TensorBoardStatsHandler(
+            output_transform=lambda x: None,  # no need to plot loss value, so disable per iteration output
+            global_epoch_transform=lambda x: trainer.state.iteration,
+        )  # fetch global iteration number from trainer
+        val_tensorboard_stats_handler.attach(evaluator)
+
+        # add handler to draw the first image and the corresponding label and model output in the last batch
+        # here we draw the 3D output as GIF format along the depth axis, every 2 validation iterations.
+        val_tensorboard_image_handler = TensorBoardImageHandler(
+            batch_transform=lambda batch: (batch["img"], batch["seg"]),
+            output_transform=lambda output: output[0],
+            global_iter_transform=lambda x: trainer.state.epoch,
+        )
+        evaluator.add_event_handler(
+            event_name=Events.ITERATION_COMPLETED(every=2),
+            handler=val_tensorboard_image_handler,
+        )
     if checkpoint_folder is None:
         checkpoint_folder = './checkpoints/'
         warnings.warn(f'No checkpoint folder specified, using {checkpoint_folder}')
@@ -385,8 +436,6 @@ def experiment_3(data, hyper_parameters, k_fold, dimensions_and_architectures, l
 if __name__ == '__main__':
     # np.random.seed(42)
     chaos_csv = 'chaos.csv'
-    # all_chaos_files = pd.read_csv(chaos_csv, dtype=object).values
-    # k_fold = 2 TODO
     # losses = ['CEL+DICE']
     # dimensions_and_architectures = ([3, UNet])
     #
@@ -404,4 +453,5 @@ if __name__ == '__main__':
     # print("first volume's shape: ", check_data["img"].shape, check_data["seg"].shape)
     # train(data_loader=get_slice_loader(), dict_transforms=True)
     # set_device(name='gtx 1050')
-    train_k_fold(k_fold=3)
+    cfg.training_epochs = 1
+    train_k_fold(k_fold=2)
